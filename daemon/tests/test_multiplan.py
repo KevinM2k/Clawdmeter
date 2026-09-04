@@ -85,12 +85,12 @@ def test_plan_label_titlecases_unknown_subscription(tmp_path):
 
 def test_plan_label_falls_back_to_dir_suffix(tmp_path):
     """No credentials at all -> name it after the dir, never leave it blank."""
-    d = tmp_path / ".claude-personal"
+    d = tmp_path / ".claude-example"
     d.mkdir()
     monkey = mod.sys.platform
     assert monkey is not None
     with patch.object(mod, "_credentials_blob", return_value=None):
-        assert mod.read_plan_label(d) == "Personal"
+        assert mod.read_plan_label(d) == "Example"
         assert mod.read_plan_label(tmp_path / ".claude") == "Claude"
 
 

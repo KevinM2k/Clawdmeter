@@ -6,6 +6,7 @@ Covers read_config_dirs, read_token_for, PlanSelector, and poll_active_payload.
 Run: python -m pytest daemon/tests/test_macos_multidir.py -x -q
 """
 import asyncio
+import hashlib
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -77,8 +78,10 @@ def test_token_for_file_wins_over_keychain(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_keychain_services_suffix_with_path_hash():
-    personal = Path("/Users/kevin/.claude-personal")
-    assert mod._keychain_services_for(personal) == ["Claude Code-credentials-5e7f203e"]
+    """The suffix is the first 8 hex of sha256 over the dir's absolute path."""
+    d = Path("/home/example/.claude-personal")
+    digest = hashlib.sha256(str(d).encode()).hexdigest()[:8]
+    assert mod._keychain_services_for(d) == [f"Claude Code-credentials-{digest}"]
 
 
 def test_keychain_services_include_unsuffixed_for_default_dir():

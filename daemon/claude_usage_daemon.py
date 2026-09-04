@@ -25,13 +25,86 @@ import httpx
 from bleak import BleakClient
 from bleak.exc import BleakError
 
-DEVICE_NAME = "Clawdmeter"
+# ---------------------------------------------------------------------------
+# Settings come from, in order of precedence:
+#   1. a real environment variable (CLAWDMETER_*) — for a launchd/systemd unit
+#   2. a `.env` file in the repo root — the usual place to edit them
+#   3. ~/.config/claude-usage-monitor/config — written by the installer
+#   4. the defaults below
+# Nothing here is secret: the OAuth token is read from the Keychain (macOS) or
+# ~/.claude/.credentials.json at runtime and never stored in this repo.
+# ---------------------------------------------------------------------------
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+ENV_PREFIX = "CLAWDMETER_"
+
+_env_cache: dict[str, str] | None = None
+_env_mtime: float | None = None
+
+
+def _load_env_file() -> dict[str, str]:
+    """Parse the repo-root .env, re-reading it whenever it changes on disk.
+
+    Deliberately quiet: the file is optional, so an unreadable one falls back
+    to the other sources rather than failing the daemon.
+    """
+    global _env_cache, _env_mtime
+    try:
+        mtime = ENV_FILE.stat().st_mtime
+    except OSError:
+        _env_cache, _env_mtime = {}, None
+        return _env_cache
+    if _env_cache is not None and _env_mtime == mtime:
+        return _env_cache
+
+    values: dict[str, str] = {}
+    try:
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            val = val.split(" #", 1)[0].strip()          # trailing comment
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1]                          # quoted value
+            values[key.strip().upper()] = val
+    except OSError:
+        values = {}
+    _env_cache, _env_mtime = values, mtime
+    return values
+
+
+def env_setting(name: str) -> str | None:
+    """A setting from the process environment, else the repo's .env, else None."""
+    key = ENV_PREFIX + name.upper()
+    val = os.environ.get(key)
+    if val is None:
+        val = _load_env_file().get(key)
+    val = val.strip() if val else ""
+    return val or None
+
+
+def env_number(name: str, default: float) -> float:
+    """Numeric setting, falling back to `default` when unset or unparseable."""
+    raw = env_setting(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+DEVICE_NAME = env_setting("device_name") or "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
-POLL_INTERVAL = 60
-TICK = 5
+POLL_INTERVAL = env_number("poll_interval", 60)
+TICK = env_number("tick", 5)
 CONNECT_TIMEOUT = 20.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -49,8 +122,8 @@ USAGE_BETA = "oauth-2025-04-20"
 # This endpoint rate-limits hard (429), and a per-model *weekly* window barely
 # moves, so it is cached rather than polled every cycle. On a refusal the last
 # known value is reused: a limit that exists must not blink out of the display.
-SCOPED_TTL = 600.0      # seconds between successful refreshes
-SCOPED_RETRY = 120.0    # seconds before retrying after a refusal
+SCOPED_TTL = env_number("scoped_ttl", 600.0)      # between successful refreshes
+SCOPED_RETRY = env_number("scoped_retry", 120.0)  # before retrying a refusal
 MAX_PLANS = 3   # firmware holds this many pages; keeps the payload inside 512 B
 API_HEADERS_TEMPLATE = {
     "anthropic-version": "2023-06-01",
@@ -223,9 +296,9 @@ def read_config_dirs() -> list[Path]:
     Defaults to [~/.claude] so existing single-plan setups are unchanged. ~ is
     expanded. Mirrors the Linux bash daemon's read_config_dirs.
     """
-    raw = ""
+    raw = env_setting("config_dirs") or ""
     try:
-        if CONFIG_FILE.exists():
+        if not raw and CONFIG_FILE.exists():
             for line in CONFIG_FILE.read_text().splitlines():
                 line = line.split("#", 1)[0].strip()
                 if "=" not in line:
@@ -438,6 +511,9 @@ def read_chime_setting() -> str:
     Defaults to "off" (the device stays silent) so existing setups are
     unaffected until the user opts in.
     """
+    env = env_setting("chime")
+    if env:
+        return "on" if env.strip().lower() in ("on", "1", "true", "yes") else "off"
     try:
         if CONFIG_FILE.exists():
             for line in CONFIG_FILE.read_text().splitlines():
@@ -460,6 +536,9 @@ def read_clock_setting() -> str:
     Defaults to "off" (no clock; the device keeps showing "Usage") so existing
     setups are unaffected until the user opts in.
     """
+    env = env_setting("clock")
+    if env and env.strip().lower() in ("off", "auto", "12", "24"):
+        return env.strip().lower()
     try:
         if CONFIG_FILE.exists():
             for line in CONFIG_FILE.read_text().splitlines():
