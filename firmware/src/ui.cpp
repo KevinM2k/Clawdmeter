@@ -6,6 +6,7 @@
 #include "clawd_still.h"
 #include "icons.h"
 #include "hal/board_caps.h"
+#include "hal/imu_hal.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -44,6 +45,13 @@ struct Layout {
     const lv_font_t* ent_pct_font;   // enterprise spending number
     const lv_font_t* pill_font;      // "Current" / "Weekly" pill
     const lv_font_t* reset_font;     // "Resets in ..." line
+    const lv_font_t* pct_font_sm;    // compact percentage, once a third limit appears
+    const lv_font_t* reset_font_sm;  // compact "Resets in ..." line
+    const lv_font_t* plan_font;      // plan-name row under the header
+    int16_t row_gap;                 // between rows inside the card
+    int16_t head_gap;                // between a row's number/pill and its bar
+    int16_t plan_row_h;              // vertical space the plan row consumes
+    int16_t dot_r;                   // page-indicator dot radius
     const lv_font_t* pace_font;      // enterprise "Under/On/Over pace" line
     const lv_font_t* anim_font;      // animated status line
     int16_t anim_y;                  // status line offset from bottom
@@ -90,6 +98,13 @@ static void compute_layout(const BoardCaps& c) {
     L.ent_pct_font = &font_tiempos_56;
     L.pill_font    = &font_styrene_28;
     L.reset_font   = &font_styrene_28;
+    L.pct_font_sm   = &font_styrene_28;
+    L.reset_font_sm = &font_styrene_20;
+    L.row_gap       = 18;
+    L.head_gap      = 6;
+    L.plan_font     = &font_styrene_24;
+    L.plan_row_h    = 34;
+    L.dot_r         = 4;
     L.pace_font    = &font_styrene_16;
     L.anim_font    = &font_mono_32;
     L.anim_y = -15;
@@ -124,6 +139,8 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 12;
         L.usage_bar_y = 48;
         L.usage_reset_y = 78;
+        L.plan_font     = &font_styrene_20;
+        L.plan_row_h    = 28;
         L.bt_info_panel_h = 140;
         L.bt_reset_zone_h = 90;
         L.bt_title_font    = &font_tiempos_34;
@@ -152,6 +169,13 @@ static void compute_layout(const BoardCaps& c) {
         L.ent_pct_font = &font_tiempos_34;
         L.pill_font    = &font_styrene_14;
         L.reset_font   = &font_styrene_14;
+        L.pct_font_sm   = &font_styrene_16;
+        L.reset_font_sm = &font_styrene_14;
+        L.row_gap       = 8;
+        L.head_gap      = 3;
+        L.plan_font     = &font_styrene_14;
+        L.plan_row_h    = 20;
+        L.dot_r         = 3;
         L.pace_font    = &font_styrene_12;
         L.anim_font    = &font_mono_18;
         // Center the status line in the strip below the weekly panel; flush
@@ -209,12 +233,39 @@ static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
-static lv_obj_t* panel_session = nullptr;
-static lv_obj_t* panel_weekly = nullptr;
-// Enterprise-only widgets inside panel_session
+static lv_obj_t* usage_card = nullptr;   // one card holding every metric row
+static lv_obj_t* rule_session = nullptr;
+static lv_obj_t* rule_weekly = nullptr;
+static lv_obj_t* rule_scoped = nullptr;
+static lv_obj_t* row_session = nullptr;
+static lv_obj_t* row_weekly = nullptr;
+// Enterprise-only widgets inside row_session
 static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
 static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
+
+// Third usage panel: a per-model ("scoped") limit such as Fable's weekly
+// window, which the rate-limit headers don't carry. Only plans reporting one
+// get this panel; the other two compact to make room.
+static lv_obj_t* row_scoped = nullptr;
+static lv_obj_t* lbl_scoped_pct = nullptr;
+static lv_obj_t* lbl_scoped_label = nullptr;
+static lv_obj_t* bar_scoped = nullptr;
+static lv_obj_t* lbl_scoped_reset = nullptr;
+
+// Plan row: the plan's name, plus one page dot per plan. Hidden entirely when
+// the daemon reports a single plan, so the classic layout is untouched.
+static lv_obj_t* plan_row = nullptr;
+static lv_obj_t* lbl_plan = nullptr;
+static lv_obj_t* page_dots[MAX_PLANS] = {};
+static lv_obj_t* expired_group = nullptr;
+
+// Plans as last sent, and which one is on screen. A swipe pins the page so it
+// stays where you put it; until then it follows whichever plan is in use.
+static UsagePlans s_plans = {};
+static int  s_page = 0;
+static bool s_page_pinned = false;
+static uint32_t s_gesture_ms = 0;   // suppresses the click that ends a swipe
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
 // ---- Battery indicator (shared, on top) ----
@@ -313,6 +364,8 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
+static void usage_gesture_cb(lv_event_t* e);
+static void render_plan(const UsageData* data);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -355,18 +408,13 @@ static void init_icon_dsc_rgb565a8(lv_image_dsc_t* dsc, int w, int h, const uint
     dsc->data_size = w * h * 3;
 }
 
-static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
+// Row label ("Current" / "Weekly" / the model name). Plain text, no badge:
+// the badge's padding was the tallest thing in the row and crowded the bar.
+static lv_obj_t* make_row_label(lv_obj_t* parent, const char* text) {
     lv_obj_t* lbl = lv_label_create(parent);
     lv_label_set_text(lbl, text);
     lv_obj_set_style_text_font(lbl, L.pill_font, 0);
-    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl, L.pill_pad_x, 0);
-    lv_obj_set_style_pad_right(lbl, L.pill_pad_x, 0);
-    lv_obj_set_style_pad_top(lbl, L.pill_pad_y, 0);
-    lv_obj_set_style_pad_bottom(lbl, L.pill_pad_y, 0);
+    lv_obj_set_style_text_color(lbl, COL_DIM, 0);
     return lbl;
 }
 
@@ -388,30 +436,46 @@ static void init_battery_icons(void) {
 
 // ======== Usage Screen ========
 
-static lv_obj_t* make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
-                                  lv_obj_t** out_pct, lv_obj_t** out_pill,
-                                  lv_obj_t** out_bar, lv_obj_t** out_reset) {
-    lv_obj_t* panel = make_panel(parent, L.margin, y, L.content_w, L.usage_panel_h);
+// One metric row inside the shared card: number and pill on top, then the bar,
+// then the reset line. Transparent — the card behind it draws the surface.
+static lv_obj_t* make_usage_row(lv_obj_t* card, const char* pill_text,
+                                lv_obj_t** out_pct, lv_obj_t** out_pill,
+                                lv_obj_t** out_bar, lv_obj_t** out_reset,
+                                lv_obj_t** out_rule) {
+    lv_obj_t* row = lv_obj_create(card);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    *out_pct = lv_label_create(panel);
+    *out_pct = lv_label_create(row);
     lv_label_set_text(*out_pct, "---%");
     lv_obj_set_style_text_font(*out_pct, L.pct_font, 0);
     lv_obj_set_style_text_color(*out_pct, COL_TEXT, 0);
     lv_obj_set_pos(*out_pct, 0, 0);
 
-    *out_pill = make_pill(panel, pill_text);
-    lv_obj_align(*out_pill, LV_ALIGN_TOP_RIGHT, 0, 1);
+    *out_pill = make_row_label(row, pill_text);
+    lv_obj_align(*out_pill, LV_ALIGN_TOP_RIGHT, 0, 0);
 
-    *out_bar = make_bar(panel, 0, L.usage_bar_y,
-                        L.content_w - 2 * L.panel_pad_x, L.bar_h);
+    *out_bar = make_bar(row, 0, L.usage_bar_y, L.content_w - 2 * L.panel_pad_x, L.bar_h);
 
-    *out_reset = lv_label_create(panel);
+    *out_reset = lv_label_create(row);
     lv_label_set_text(*out_reset, "---");
     lv_obj_set_style_text_font(*out_reset, L.reset_font, 0);
     lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
     lv_obj_set_pos(*out_reset, 0, L.usage_reset_y);
 
-    return panel;
+    *out_rule = lv_obj_create(row);
+    lv_obj_set_style_bg_color(*out_rule, COL_BAR_BG, 0);
+    lv_obj_set_style_bg_opa(*out_rule, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(*out_rule, 0, 0);
+    lv_obj_set_style_radius(*out_rule, 0, 0);
+    lv_obj_set_style_pad_all(*out_rule, 0, 0);
+    lv_obj_clear_flag(*out_rule, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(*out_rule, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    return row;
 }
 
 // Pairing hint — shown when disconnected so the screen isn't empty and the
@@ -469,6 +533,142 @@ static void build_idle_group(lv_obj_t* parent) {
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
 }
 
+// Vertical budget for the usage panels: content top down to the animated
+// status line. Derived from the layout rather than hardcoded, so each board's
+// breakpoint keeps its own proportions.
+static int usage_content_bottom(void) {
+    int anim_h = L.anim_font ? (int)lv_font_get_line_height(L.anim_font) : 32;
+    return L.scr_h + L.anim_y - anim_h - 6;
+}
+
+struct RowGeom {
+    int h, gap, bar_y, bar_h, reset_y;
+    const lv_font_t* pct_font;
+    const lv_font_t* pill_font;
+    const lv_font_t* reset_font;
+};
+static RowGeom s_geom = {};
+
+// Fit `count` metric rows inside one card. Two rows keep the roomy fonts; a
+// third steps them down. Everything stacks off real font metrics, so the gap
+// between a row's pill and its bar holds at every breakpoint.
+static RowGeom row_geom(int count, bool plan_row_shown) {
+    RowGeom g = {};
+    if (count < 1) count = 1;
+    int top = L.content_y + (plan_row_shown ? L.plan_row_h : 0);
+    int avail = usage_content_bottom() - top - 2 * L.panel_pad_y;   // inside the card
+
+    // Try the roomiest type first and step down until `count` rows fit. Row
+    // height comes from real font metrics, so a bigger reset line can never be
+    // clipped by the row below it.
+    struct Rung { const lv_font_t* pct; const lv_font_t* reset; bool thin_bar; };
+    const Rung ladder[] = {
+        { L.pct_font,    L.reset_font,    false },
+        { L.pct_font_sm, L.reset_font,    false },
+        { L.pct_font_sm, L.reset_font,    true  },
+        { L.pct_font_sm, L.reset_font_sm, true  },
+    };
+    const int rungs = (int)(sizeof(ladder) / sizeof(ladder[0]));
+    for (int i = 0; i < rungs; i++) {
+        g.pct_font   = ladder[i].pct;
+        g.pill_font  = L.pill_font;   // labels keep full size at every rung
+        g.reset_font = ladder[i].reset;
+        g.bar_h      = ladder[i].thin_bar ? L.bar_h / 2 : L.bar_h;
+
+        int head = (int)lv_font_get_line_height(g.pct_font);
+        int pill = (int)lv_font_get_line_height(g.pill_font);
+        if (pill > head) head = pill;
+        g.bar_y   = head + L.head_gap;
+        g.reset_y = g.bar_y + g.bar_h + L.head_gap;
+        g.h       = g.reset_y + (int)lv_font_get_line_height(g.reset_font);
+        if (count * g.h <= avail) break;
+    }
+
+    int slack = avail - count * g.h;
+    g.gap = (count > 1 && slack > 0) ? slack / (count - 1) : 0;
+    if (g.gap > L.row_gap) g.gap = L.row_gap;
+    return g;
+}
+
+// Size the card and lay the rows out inside it. Rows beyond `count` are hidden.
+static void layout_usage_rows(int count, bool plan_row_shown) {
+    RowGeom g = row_geom(count, plan_row_shown);
+    s_geom = g;
+    int top = L.content_y + (plan_row_shown ? L.plan_row_h : 0);
+    int card_h = 2 * L.panel_pad_y + count * g.h + (count - 1) * g.gap;
+    int row_w = L.content_w - 2 * L.panel_pad_x;
+
+    if (usage_card) {
+        lv_obj_set_pos(usage_card, L.margin, top);
+        lv_obj_set_size(usage_card, L.content_w, card_h);
+    }
+
+    struct Row { lv_obj_t* row; lv_obj_t* pct; lv_obj_t* pill; lv_obj_t* bar; lv_obj_t* reset; lv_obj_t* rule; };
+    Row rows[3] = {
+        { row_session, lbl_session_pct, lbl_session_label, bar_session, lbl_session_reset, rule_session },
+        { row_weekly,  lbl_weekly_pct,  lbl_weekly_label,  bar_weekly,  lbl_weekly_reset,  rule_weekly  },
+        { row_scoped,  lbl_scoped_pct,  lbl_scoped_label,  bar_scoped,  lbl_scoped_reset,  rule_scoped  },
+    };
+    int y = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!rows[i].row) continue;
+        if (i >= count) {
+            lv_obj_add_flag(rows[i].row, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_clear_flag(rows[i].row, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(rows[i].row, 0, y);
+        lv_obj_set_size(rows[i].row, row_w, g.h);
+        lv_obj_set_style_text_font(rows[i].pct, g.pct_font, 0);
+        lv_obj_set_style_text_font(rows[i].pill, g.pill_font, 0);
+        lv_obj_align(rows[i].pill, LV_ALIGN_TOP_RIGHT, 0, 0);
+        lv_obj_set_pos(rows[i].bar, 0, g.bar_y);
+        lv_obj_set_size(rows[i].bar, row_w, g.bar_h);
+        lv_obj_set_style_text_font(rows[i].reset, g.reset_font, 0);
+        lv_obj_set_pos(rows[i].reset, 0, g.reset_y);
+        if (rows[i].rule) {
+            if (i == count - 1) {
+                lv_obj_add_flag(rows[i].rule, LV_OBJ_FLAG_HIDDEN);   // nothing below it
+            } else {
+                lv_obj_clear_flag(rows[i].rule, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_pos(rows[i].rule, 0, g.h - 1);   // inside the row: children are clipped
+                lv_obj_set_size(rows[i].rule, row_w, 1);
+            }
+        }
+        y += g.h + g.gap;
+    }
+}
+
+// The plan name plus one dot per plan, right-aligned. Only shown when there is
+// more than one plan — a single-plan setup keeps the original screen.
+static void update_plan_row(const UsageData* data, bool multi) {
+    if (!plan_row) return;
+    if (!multi) {
+        lv_obj_add_flag(plan_row, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(plan_row, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(lbl_plan, data->label[0] ? data->label : "Plan");
+
+    // One dot per plan only. A dot for the splash would imply swiping reaches
+    // it, and it doesn't — the splash is a tap away, not a swipe away.
+    int n = s_plans.count > MAX_PLANS ? MAX_PLANS : s_plans.count;
+    int here = s_page;
+    int d = L.dot_r * 2;
+    int step = d + L.dot_r * 2;
+    for (int i = 0; i < MAX_PLANS; i++) {
+        if (!page_dots[i]) continue;
+        if (i >= n) {
+            lv_obj_add_flag(page_dots[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_clear_flag(page_dots[i], LV_OBJ_FLAG_HIDDEN);
+        int x = L.content_w - (n - i) * step + L.dot_r;
+        lv_obj_set_pos(page_dots[i], x, (L.plan_row_h - d) / 2);
+        lv_obj_set_style_bg_color(page_dots[i], i == here ? COL_ACCENT : COL_DIM, 0);
+    }
+}
+
 static void init_usage_screen(lv_obj_t* scr) {
     usage_container = lv_obj_create(scr);
     lv_obj_set_size(usage_container, L.scr_w, L.scr_h);
@@ -478,6 +678,12 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_pad_all(usage_container, 0, 0);
     lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(usage_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(usage_container, usage_gesture_cb, LV_EVENT_GESTURE, NULL);
+    // LVGL gives every child object GESTURE_BUBBLE by default (lv_obj.c), and
+    // indev_gesture() walks up while the flag is set — delivering the gesture to
+    // the first ancestor WITHOUT it. Left as-is that is the screen, so clearing
+    // it here is what makes this container the gesture target.
+    lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
     lbl_title = lv_label_create(usage_container);
     lv_label_set_text(lbl_title, "Usage");
@@ -498,36 +704,100 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_clear_flag(usage_group, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(usage_group, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    panel_session = make_usage_panel(usage_group, L.content_y, "Current",
-                     &lbl_session_pct, &lbl_session_label,
-                     &bar_session, &lbl_session_reset);
+    // Every metric lives in one card: the padding saved by not giving each its
+    // own card pays for the gap between a row's pill and its bar.
+    usage_card = make_panel(usage_group, L.margin, L.content_y,
+                            L.content_w, L.usage_panel_h);
 
-    // Enterprise-only overlays inside panel_session — hidden until enterprise data arrives
-    lbl_session_pct_sym = lv_label_create(panel_session);
+    row_session = make_usage_row(usage_card, "Current",
+                     &lbl_session_pct, &lbl_session_label,
+                     &bar_session, &lbl_session_reset, &rule_session);
+
+    // Enterprise-only overlays inside row_session — hidden until enterprise data arrives
+    lbl_session_pct_sym = lv_label_create(row_session);
     lv_label_set_text(lbl_session_pct_sym, "%");
     lv_obj_set_style_text_font(lbl_session_pct_sym, L.reset_font, 0);
     lv_obj_set_style_text_color(lbl_session_pct_sym, COL_TEXT, 0);
     lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
 
-    lbl_spending_desc = lv_label_create(panel_session);
+    lbl_spending_desc = lv_label_create(row_session);
     lv_label_set_text(lbl_spending_desc, "of your monthly budget");
     lv_obj_set_style_text_font(lbl_spending_desc, L.reset_font, 0);
     lv_obj_set_style_text_color(lbl_spending_desc, COL_DIM, 0);
     lv_obj_set_pos(lbl_spending_desc, 0, L.usage_reset_y);
     lv_obj_add_flag(lbl_spending_desc, LV_OBJ_FLAG_HIDDEN);
 
-    lbl_spending_status = lv_label_create(panel_session);
+    lbl_spending_status = lv_label_create(row_session);
     lv_label_set_text(lbl_spending_status, "");
     lv_obj_set_style_text_font(lbl_spending_status, L.pace_font, 0);
     lv_obj_set_pos(lbl_spending_status, 0, L.usage_reset_y + 20);
     lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
 
-    panel_weekly = make_usage_panel(usage_group,
-                     L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly",
+    row_weekly = make_usage_row(usage_card, "Weekly",
                      &lbl_weekly_pct, &lbl_weekly_label,
-                     &bar_weekly, &lbl_weekly_reset);
+                     &bar_weekly, &lbl_weekly_reset, &rule_weekly);
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
+
+    // Per-model limit row. Shown by layout_usage_rows() only for plans that
+    // report one; the pill text is the model name the daemon sends.
+    row_scoped = make_usage_row(usage_card, "Model",
+                     &lbl_scoped_pct, &lbl_scoped_label,
+                     &bar_scoped, &lbl_scoped_reset, &rule_scoped);
+    lv_obj_add_flag(row_scoped, LV_OBJ_FLAG_HIDDEN);
+
+    plan_row = lv_obj_create(usage_group);
+    lv_obj_set_size(plan_row, L.content_w, L.plan_row_h);
+    lv_obj_set_pos(plan_row, L.margin, L.content_y);
+    lv_obj_set_style_bg_opa(plan_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(plan_row, 0, 0);
+    lv_obj_set_style_pad_all(plan_row, 0, 0);
+    lv_obj_clear_flag(plan_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(plan_row, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lbl_plan = lv_label_create(plan_row);
+    lv_label_set_text(lbl_plan, "");
+    lv_obj_set_style_text_font(lbl_plan, L.plan_font, 0);
+    lv_obj_set_style_text_color(lbl_plan, COL_DIM, 0);
+    lv_obj_align(lbl_plan, LV_ALIGN_LEFT_MID, 0, 0);
+
+    for (int i = 0; i < MAX_PLANS; i++) {
+        page_dots[i] = lv_obj_create(plan_row);
+        lv_obj_set_size(page_dots[i], L.dot_r * 2, L.dot_r * 2);
+        lv_obj_set_style_radius(page_dots[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(page_dots[i], 0, 0);
+        lv_obj_set_style_bg_opa(page_dots[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_pad_all(page_dots[i], 0, 0);
+        lv_obj_clear_flag(page_dots[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(page_dots[i], LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_flag(page_dots[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_flag(plan_row, LV_OBJ_FLAG_HIDDEN);
+
+    // Shown in place of the panels when a plan's token has expired: the page
+    // stays put and explains itself instead of vanishing mid-swipe.
+    expired_group = lv_obj_create(usage_group);
+    lv_obj_set_size(expired_group, L.scr_w, L.scr_h - L.content_y - L.plan_row_h);
+    lv_obj_set_pos(expired_group, 0, L.content_y + L.plan_row_h);
+    lv_obj_set_style_bg_opa(expired_group, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(expired_group, 0, 0);
+    lv_obj_set_style_pad_all(expired_group, 0, 0);
+    lv_obj_clear_flag(expired_group, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(expired_group, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_t* x1 = lv_label_create(expired_group);
+    lv_label_set_text(x1, "Signed out");
+    lv_obj_set_style_text_font(x1, L.bt_status_font, 0);
+    lv_obj_set_style_text_color(x1, COL_TEXT, 0);
+    lv_obj_align(x1, LV_ALIGN_TOP_MID, 0, L.pair_y1);
+
+    lv_obj_t* x2 = lv_label_create(expired_group);
+    lv_label_set_text(x2, "use Claude Code on this\nplan to sign back in");
+    lv_obj_set_style_text_font(x2, L.reset_font, 0);
+    lv_obj_set_style_text_color(x2, COL_DIM, 0);
+    lv_obj_set_style_text_align(x2, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(x2, LV_ALIGN_TOP_MID, 0, L.pair_y2);
+    lv_obj_add_flag(expired_group, LV_OBJ_FLAG_HIDDEN);
 
     build_pair_group(usage_container);
     build_idle_group(usage_container);
@@ -590,22 +860,24 @@ void ui_init(void) {
     }
 }
 
-void ui_update(const UsageData* data) {
-    if (!data->valid) return;
-    data_ok = data->ok;
-    if (!data->ok) return;          // a {"ok":false} "no data" beat → fall through to idle, keep last numbers
-    last_data_ms = lv_tick_get();   // a real usage update just landed
-    data_received = true;
+// Draw one plan into the usage panels. Runs on a fresh payload and on a swipe.
+static void render_plan(const UsageData* data) {
+    const bool multi = s_plans.count > 1;
+    update_plan_row(data, multi);
 
-    if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
-        clock_base_epoch = data->clock_epoch;
-        clock_base_ms = last_data_ms;
-        clock_fmt = data->clock_fmt;
-    } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
-        clock_base_epoch = 0;
-        clock_last_min = -1;
-        lv_label_set_text(lbl_title, "Usage");
+    if (data->expired) {
+        // Nothing to plot — the page keeps its name and says why it is blank.
+        if (usage_card) lv_obj_add_flag(usage_card, LV_OBJ_FLAG_HIDDEN);
+        if (expired_group) lv_obj_clear_flag(expired_group, LV_OBJ_FLAG_HIDDEN);
+        return;
     }
+    if (expired_group) lv_obj_add_flag(expired_group, LV_OBJ_FLAG_HIDDEN);
+    if (usage_card) lv_obj_clear_flag(usage_card, LV_OBJ_FLAG_HIDDEN);
+
+    // Enterprise already uses both panels for spending/period, so a scoped
+    // limit only ever adds a third panel on the Pro/Max layout.
+    const bool has_scoped = (data->scoped_pct >= 0) && !data->enterprise;
+    layout_usage_rows(has_scoped ? 3 : 2, multi);
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
@@ -617,15 +889,16 @@ void ui_update(const UsageData* data) {
         lv_obj_clear_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_status,   LV_OBJ_FLAG_HIDDEN);
-        if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
+        if (row_weekly) lv_obj_clear_flag(row_weekly, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
+        lv_obj_set_style_text_font(lbl_session_pct,
+                                   s_geom.pct_font ? s_geom.pct_font : L.pct_font, 0);
         lv_label_set_text(lbl_session_label, "Current");
         lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
-        if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
+        if (row_weekly) lv_obj_clear_flag(row_weekly, LV_OBJ_FLAG_HIDDEN);
     }
 
     char buf[48];
@@ -673,6 +946,108 @@ void ui_update(const UsageData* data) {
         format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
         lv_label_set_text(lbl_weekly_reset, buf);
     }
+
+    if (has_scoped) {
+        lv_label_set_text(lbl_scoped_label,
+                          data->scoped_name[0] ? data->scoped_name : "Model");
+        lv_label_set_text_fmt(lbl_scoped_pct, "%d%%", data->scoped_pct);
+        lv_bar_set_value(bar_scoped, data->scoped_pct, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_scoped, pct_color((float)data->scoped_pct),
+                                  LV_PART_INDICATOR);
+        format_reset_time(data->scoped_reset_mins, buf, sizeof(buf));
+        lv_label_set_text(lbl_scoped_reset, buf);
+    }
+}
+
+// LVGL gesture directions in clockwise screen order.
+static const lv_dir_t SWIPE_CW[4] = { LV_DIR_RIGHT, LV_DIR_BOTTOM, LV_DIR_LEFT, LV_DIR_TOP };
+
+// Which way the user actually swiped, as a page step (+1 next, -1 previous,
+// 0 = not a page change).
+//
+// Boards that auto-rotate rotate the *rendered pixels* by the IMU quadrant
+// while LVGL and touch stay in the panel's unrotated space — and the touch
+// swap/mirror is fixed at init, so it does not follow. Undoing the quadrant
+// puts the gesture back in the frame the user is holding.
+//
+// The quadrant is not always knowable, though: accel_to_rotation() reports
+// "ambiguous" whenever the board lies near face-up, which is exactly how it
+// sits on a desk, and the quadrant then stays 0 however the board is turned.
+// So BOTH axes page. Relying on the horizontal one alone leaves a rotated,
+// desk-mounted board with no working swipe at all.
+static int swipe_step(lv_dir_t dir) {
+    int i = -1;
+    for (int k = 0; k < 4; k++) {
+        if (SWIPE_CW[k] == dir) { i = k; break; }
+    }
+    if (i < 0) return 0;
+    const int r = (int)(imu_hal_rotation_quadrant() & 3);
+    switch ((i - r + 4) & 3) {
+    case 2:            // left
+    case 3:  return 1;    // up    -> next plan
+    default: return -1;   // right / down -> previous plan
+    }
+}
+
+// Horizontal swipe pages between plans, and pins the page there: the device is
+// most useful showing what you asked for, not what it thinks you want.
+static void usage_gesture_cb(lv_event_t* e) {
+    (void)e;
+    if (s_plans.count <= 1) return;
+    lv_indev_t* indev = lv_indev_active();
+    if (!indev) return;
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    int step = swipe_step(dir);
+    if (step == 0) return;
+
+    // Consume the rest of this press so it can't also arrive as a click.
+    lv_indev_wait_release(indev);
+    s_gesture_ms = lv_tick_get();
+
+    int next = s_page + step;
+    if (next < 0) next = s_plans.count - 1;
+    if (next >= s_plans.count) next = 0;
+    s_page = next;
+    s_page_pinned = true;
+    render_plan(&s_plans.plan[s_page]);
+}
+
+void ui_update_plans(const UsagePlans* plans) {
+    if (!plans->valid || plans->count < 1) return;
+    s_plans = *plans;
+    if (s_plans.count > MAX_PLANS) s_plans.count = MAX_PLANS;
+
+    const UsageData* first = &s_plans.plan[0];
+    data_ok = first->ok;
+    if (!first->ok) return;         // a {"ok":false} "no data" beat → fall through to idle, keep last numbers
+    last_data_ms = lv_tick_get();   // a real usage update just landed
+    data_received = true;
+
+    if (first->clock_epoch > 0) {   // daemon supplied wall-clock time → drive the title clock
+        clock_base_epoch = first->clock_epoch;
+        clock_base_ms = last_data_ms;
+        clock_fmt = first->clock_fmt;
+    } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
+        clock_base_epoch = 0;
+        clock_last_min = -1;
+        lv_label_set_text(lbl_title, "Usage");
+    }
+
+    // Follow the plan in use until a swipe pins the page; after that the page
+    // only moves when you move it.
+    if (!s_page_pinned) s_page = s_plans.active;
+    if (s_page < 0 || s_page >= s_plans.count) s_page = 0;
+
+    render_plan(&s_plans.plan[s_page]);
+}
+
+void ui_update(const UsageData* data) {
+    UsagePlans one = {};
+    one.plan[0] = *data;
+    one.count = 1;
+    one.active = 0;
+    one.valid = data->valid;
+    ui_update_plans(&one);
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -765,6 +1140,9 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
+    // A swipe ends in a release that LVGL also reports as a click; without this
+    // guard every page change would bounce the view to the splash.
+    if (s_gesture_ms && (lv_tick_get() - s_gesture_ms) < 400) return;
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
     else                                  ui_show_screen(SCREEN_SPLASH);
 }

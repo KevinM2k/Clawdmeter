@@ -58,7 +58,7 @@ def test_token_for_default_dir_falls_back_to_keychain_on_macos(tmp_path, monkeyp
     # An empty dir standing in as the default: no file present -> Keychain.
     monkeypatch.setattr(mod, "DEFAULT_CONFIG_DIR", tmp_path)
     monkeypatch.setattr(mod.sys, "platform", "darwin")
-    with patch.object(mod, "_read_token_keychain", return_value="TOK_KEYCHAIN"):
+    with patch.object(mod, "_keychain_blob", return_value='{"accessToken":"TOK_KEYCHAIN"}'):
         assert read_token_for(tmp_path) == "TOK_KEYCHAIN"
 
 
@@ -66,8 +66,69 @@ def test_token_for_file_wins_over_keychain(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "DEFAULT_CONFIG_DIR", tmp_path)
     monkeypatch.setattr(mod.sys, "platform", "darwin")
     (tmp_path / ".credentials.json").write_text('{"accessToken":"TOK_FILE"}')
-    with patch.object(mod, "_read_token_keychain", return_value="TOK_KEYCHAIN"):
+    with patch.object(mod, "_keychain_blob", return_value='{"accessToken":"TOK_KEYCHAIN"}'):
         assert read_token_for(tmp_path) == "TOK_FILE"
+
+
+# ---------------------------------------------------------------------------
+# Per-config-dir Keychain entries. Claude Code stores each CLAUDE_CONFIG_DIR's
+# token under its own service name, so a second plan with no .credentials.json
+# is still readable on macOS.
+# ---------------------------------------------------------------------------
+
+def test_keychain_services_suffix_with_path_hash():
+    personal = Path("/Users/kevin/.claude-personal")
+    assert mod._keychain_services_for(personal) == ["Claude Code-credentials-5e7f203e"]
+
+
+def test_keychain_services_include_unsuffixed_for_default_dir():
+    svcs = mod._keychain_services_for(mod.DEFAULT_CONFIG_DIR)
+    assert svcs[-1] == mod.KEYCHAIN_SERVICE and len(svcs) == 2
+
+
+def test_token_for_non_default_dir_reads_suffixed_keychain(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "DEFAULT_CONFIG_DIR", tmp_path / "default")
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    seen = []
+
+    def fake_blob(service):
+        seen.append(service)
+        return '{"accessToken":"TOK_PERSONAL"}'
+
+    monkeypatch.setattr(mod, "_keychain_blob", fake_blob)
+    assert read_token_for(tmp_path) == "TOK_PERSONAL"
+    assert seen == mod._keychain_services_for(tmp_path)  # suffixed only, no legacy probe
+
+
+def test_keychain_picks_freshest_entry_not_first(tmp_path, monkeypatch):
+    """A stale entry lingers after a CLI upgrade; latest expiresAt must win."""
+    monkeypatch.setattr(mod, "DEFAULT_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    suffixed, legacy = mod._keychain_services_for(tmp_path)
+    blobs = {
+        suffixed: '{"claudeAiOauth":{"accessToken":"TOK_STALE","expiresAt":1000}}',
+        legacy: '{"claudeAiOauth":{"accessToken":"TOK_LIVE","expiresAt":9000}}',
+    }
+    monkeypatch.setattr(mod, "_keychain_blob", lambda s: blobs.get(s))
+    assert read_token_for(tmp_path) == "TOK_LIVE"
+
+
+def test_keychain_skips_entry_with_blank_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "DEFAULT_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    suffixed, legacy = mod._keychain_services_for(tmp_path)
+    blobs = {
+        suffixed: '{"claudeAiOauth":{"accessToken":"","expiresAt":9999}}',  # logged out
+        legacy: '{"claudeAiOauth":{"accessToken":"TOK_LIVE","expiresAt":10}}',
+    }
+    monkeypatch.setattr(mod, "_keychain_blob", lambda s: blobs.get(s))
+    assert read_token_for(tmp_path) == "TOK_LIVE"
+
+
+def test_blob_expiry_handles_missing_and_garbage():
+    assert mod._blob_expiry('{"claudeAiOauth":{"expiresAt":42}}') == 42
+    assert mod._blob_expiry('{"accessToken":"x"}') == 0
+    assert mod._blob_expiry("not json") == 0
 
 
 # ---------------------------------------------------------------------------

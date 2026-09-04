@@ -37,15 +37,24 @@ upsert_config_key() {
 
 # Detect ~/.claude* config dirs and, if more than one is found, let the user pick
 # which plans to show. The daemon polls all chosen dirs and displays whichever is
-# active. macOS note: the default ~/.claude stores its token in Keychain (often no
-# .credentials.json file), so it always counts as a candidate; additional dirs are
-# recognised by their credentials file — matching the daemon's read_token_for.
+# active. macOS note: tokens usually live in the Keychain rather than a
+# .credentials.json file, so a dir counts as a candidate when it has either —
+# matching the daemon's read_token_for.
+# True when the Keychain holds a token for this config dir. macOS stores each
+# CLAUDE_CONFIG_DIR under a service suffixed with sha256(abs path)[:8].
+keychain_has_token() {
+    local svc
+    svc="Claude Code-credentials-$(printf %s "$1" | shasum -a 256 | cut -c1-8)"
+    security find-generic-password -s "$svc" -a "$USER" -w >/dev/null 2>&1
+}
+
 configure_config_dirs() {
     local -a candidates=()
     local d
     for d in "$HOME"/.claude*; do
         [ -d "$d" ] || continue
-        if [ -f "$d/.credentials.json" ] || [ "$d" = "$HOME/.claude" ]; then
+        if [ -f "$d/.credentials.json" ] || [ "$d" = "$HOME/.claude" ] \
+            || keychain_has_token "$d"; then
             candidates+=("$d")
         fi
     done

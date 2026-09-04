@@ -10,6 +10,7 @@ import asyncio
 import calendar
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -41,6 +42,16 @@ SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-addres
 CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
 
 API_URL = "https://api.anthropic.com/v1/messages"
+# Internal, beta-gated: the only source for per-model ("scoped") limits, which
+# the /v1/messages rate-limit headers omit entirely. Treated as best-effort.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_BETA = "oauth-2025-04-20"
+# This endpoint rate-limits hard (429), and a per-model *weekly* window barely
+# moves, so it is cached rather than polled every cycle. On a refusal the last
+# known value is reused: a limit that exists must not blink out of the display.
+SCOPED_TTL = 600.0      # seconds between successful refreshes
+SCOPED_RETRY = 120.0    # seconds before retrying after a refusal
+MAX_PLANS = 3   # firmware holds this many pages; keeps the payload inside 512 B
 API_HEADERS_TEMPLATE = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
@@ -116,11 +127,11 @@ def _decode_keychain_blob(raw: str) -> str:
     return raw
 
 
-def _read_token_keychain() -> str | None:
-    """Read the OAuth access token from the macOS Keychain, or None.
+def _keychain_blob(service: str) -> str | None:
+    """Raw credentials blob from a macOS Keychain service, decoded, or None.
 
     ``security … -w`` may hex-dump the stored secret (see _decode_keychain_blob),
-    so decode before extracting the access token.
+    so decode before the caller parses it.
     """
     try:
         out = subprocess.run(
@@ -128,7 +139,7 @@ def _read_token_keychain() -> str | None:
                 "security",
                 "find-generic-password",
                 "-s",
-                KEYCHAIN_SERVICE,
+                service,
                 "-a",
                 getpass.getuser(),
                 "-w",
@@ -139,12 +150,71 @@ def _read_token_keychain() -> str | None:
             timeout=10,
         )
     except subprocess.CalledProcessError as e:
-        log(f"Keychain read failed (rc={e.returncode}): {e.stderr.strip()}")
+        # rc 44 = no such item: expected when probing a dir that has no entry.
+        if e.returncode != 44:
+            log(f"Keychain read failed (rc={e.returncode}): {e.stderr.strip()}")
         return None
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log(f"Keychain access error: {e}")
         return None
-    return _extract_access_token(_decode_keychain_blob(out.stdout))
+    return _decode_keychain_blob(out.stdout)
+
+
+def _read_token_keychain(service: str = KEYCHAIN_SERVICE) -> str | None:
+    """Read the OAuth access token from a macOS Keychain service, or None."""
+    blob = _keychain_blob(service)
+    return _extract_access_token(blob) if blob else None
+
+
+def _blob_expiry(blob: str) -> int:
+    """``expiresAt`` (ms) from a credentials blob; 0 when absent/unparseable."""
+    try:
+        obj = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return 0
+    if isinstance(obj, dict):
+        inner = obj.get("claudeAiOauth")
+        src = inner if isinstance(inner, dict) else obj
+        exp = src.get("expiresAt")
+        if isinstance(exp, (int, float)):
+            return int(exp)
+    return 0
+
+
+def _keychain_services_for(config_dir: Path) -> list[str]:
+    """Keychain services that may hold this config dir's token.
+
+    Claude Code keys each CLAUDE_CONFIG_DIR by sha256(abs path)[:8]. The default
+    dir may additionally have the older unsuffixed entry, and on some installs
+    that is the one the running CLI keeps refreshing — so both are candidates.
+    """
+    digest = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    services = [f"{KEYCHAIN_SERVICE}-{digest}"]
+    if config_dir == DEFAULT_CONFIG_DIR:
+        services.append(KEYCHAIN_SERVICE)
+    return services
+
+
+def _read_token_keychain_for(config_dir: Path) -> str | None:
+    """Freshest Keychain token for one config dir, or None.
+
+    Stale entries linger after a CLI upgrade or a re-login, so pick by latest
+    ``expiresAt`` rather than by a fixed service order — whichever entry the
+    running CLI refreshes is the live one.
+    """
+    best_token: str | None = None
+    best_exp = -1
+    for service in _keychain_services_for(config_dir):
+        blob = _keychain_blob(service)
+        if not blob:
+            continue
+        token = _extract_access_token(blob)
+        if not token:
+            continue
+        exp = _blob_expiry(blob)
+        if exp > best_exp:
+            best_token, best_exp = token, exp
+    return best_token
 
 
 def read_config_dirs() -> list[Path]:
@@ -174,12 +244,9 @@ def read_config_dirs() -> list[Path]:
 def read_token_for(config_dir: Path) -> str | None:
     """Read the OAuth token for one config dir.
 
-    Linux: each dir keeps its own ``<dir>/.credentials.json``. macOS: the default
-    install stores the token in Keychain with no file, so for the default dir we
-    fall back to Keychain when no file is present — preserving existing
-    single-plan macOS behavior. Additional macOS dirs are read from their files;
-    a work plan whose token lives only in the single Keychain entry can't be told
-    apart there (documented follow-up).
+    Linux: each dir keeps its own ``<dir>/.credentials.json``. macOS: tokens live
+    in the Keychain with no file, under a per-dir service name, so every
+    configured dir resolves — not just the default one.
     """
     cred = config_dir / ".credentials.json"
     try:
@@ -187,9 +254,59 @@ def read_token_for(config_dir: Path) -> str | None:
             return _extract_access_token(cred.read_text())
     except OSError as e:
         log(f"Error reading credentials in {config_dir}: {e}")
-    if sys.platform == "darwin" and config_dir == DEFAULT_CONFIG_DIR:
-        return _read_token_keychain()
+    if sys.platform == "darwin":
+        return _read_token_keychain_for(config_dir)
     return None
+
+
+PLAN_LABELS = {
+    "team": "Team",
+    "pro": "Pro",
+    "max": "Max",
+    "enterprise": "Enterprise",
+    "free": "Free",
+}
+
+
+def _credentials_blob(config_dir: Path) -> str | None:
+    """The raw credentials blob for a config dir (file, else Keychain)."""
+    cred = config_dir / ".credentials.json"
+    try:
+        if cred.exists():
+            return cred.read_text()
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        for service in _keychain_services_for(config_dir):
+            blob = _keychain_blob(service)
+            if blob:
+                return blob
+    return None
+
+
+def read_plan_label(config_dir: Path) -> str:
+    """Display name for a config dir's plan, e.g. "Team" / "Pro".
+
+    Read from ``subscriptionType`` in the stored credentials, which is present
+    even when the access token has expired. Falls back to the dir's own suffix
+    (``~/.claude-personal`` -> "Personal") so a page is never unlabelled.
+    """
+    blob = _credentials_blob(config_dir)
+    if blob:
+        try:
+            obj = json.loads(blob)
+            src = obj.get("claudeAiOauth") if isinstance(obj, dict) else None
+            src = src if isinstance(src, dict) else obj
+            sub = str(src.get("subscriptionType") or "").lower()
+            if sub in PLAN_LABELS:
+                return PLAN_LABELS[sub]
+            if sub:
+                return sub.title()[:11]
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    name = config_dir.name
+    suffix = name[len(".claude-"):] if name.startswith(".claude-") else ""
+    return suffix.title()[:11] if suffix else "Claude"
 
 
 def load_cached_address() -> str | None:
@@ -451,6 +568,9 @@ async def poll_api(token: str) -> dict | None:
             "acct": "pro",
             "ok": True,
         }
+        scoped = await fetch_scoped_limit(token)
+        if scoped:
+            payload.update(scoped)
     else:
         reset_ts = hdr("anthropic-ratelimit-unified-overage-reset")
         payload = {
@@ -466,6 +586,88 @@ async def poll_api(token: str) -> dict | None:
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     return payload
+
+
+def _iso_reset_minutes(ts: str | None) -> int | None:
+    """Minutes until an ISO-8601 timestamp, or None when unparseable."""
+    if not ts:
+        return None
+    try:
+        when = datetime.datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    mins = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60.0
+    return int(round(mins)) if mins > 0 else 0
+
+
+_SCOPED_CACHE: dict[str, dict] = {}   # token -> {"value": ..., "next_try": ts}
+
+
+async def fetch_scoped_limit(token: str) -> dict | None:
+    """The account's binding per-model limit, e.g. Fable's weekly window.
+
+    The /v1/messages rate-limit headers carry only the 5h and 7d windows, so a
+    scoped weekly limit — which on some plans is the limit actually binding you
+    — is invisible there. This endpoint reports every limit, per-model included.
+
+    Cached for SCOPED_TTL, and on any failure the previous value is served
+    again: the endpoint answers 429 often enough that fetching per cycle made
+    the row appear and disappear between polls. A 200 that reports no scoped
+    limit *does* clear it — that is a real absence, not a refusal.
+
+    Returns {"x": pct, "xr": reset_mins, "xn": model name} or None.
+    """
+    now = time.time()
+    cached = _SCOPED_CACHE.get(token)
+    if cached and now < cached["next_try"]:
+        return cached["value"]
+
+    def keep(reason: str) -> dict | None:
+        """Serve the last known value and schedule a retry."""
+        prev = cached["value"] if cached else None
+        _SCOPED_CACHE[token] = {"value": prev, "next_try": now + SCOPED_RETRY}
+        log(f"Scoped-limit fetch {reason}; "
+            + ("keeping last known value" if prev else "no value yet"))
+        return prev
+
+    headers = {"authorization": f"Bearer {token}", "anthropic-beta": USAGE_BETA}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.get(USAGE_URL, headers=headers)
+    except httpx.HTTPError as e:
+        return keep(f"failed ({e})")
+    if resp.status_code != 200:
+        return keep(f"HTTP {resp.status_code}")
+    try:
+        limits = resp.json().get("limits") or []
+    except (ValueError, AttributeError, TypeError) as e:
+        return keep(f"unparseable ({e})")
+
+    best: tuple[int, str, str | None] | None = None
+    for lim in limits:
+        if not isinstance(lim, dict):
+            continue
+        model = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+        if not model:
+            continue
+        try:
+            pct = int(round(float(lim.get("percent") or 0)))
+        except (TypeError, ValueError):
+            continue
+        if best is None or pct > best[0]:   # most-binding scoped limit wins
+            best = (pct, str(model), lim.get("resets_at"))
+
+    out: dict | None = None
+    if best is not None:
+        pct, model, resets_at = best
+        out = {"x": max(0, min(100, pct)), "xn": model[:9]}
+        mins = _iso_reset_minutes(resets_at)
+        if mins is not None:
+            out["xr"] = mins
+    _SCOPED_CACHE[token] = {"value": out, "next_try": now + SCOPED_TTL}
+    return out
 
 
 def _billing_period_info(now: float, reset_ts: str) -> dict:
@@ -538,6 +740,35 @@ class PlanSelector:
 _SELECTOR = PlanSelector()
 
 
+async def poll_all() -> dict[Path, dict]:
+    """Poll every configured config dir once, in config order.
+
+    Returns ``{dir: {"state": ..., "payload": ...}}`` where state is:
+      "ok"       — the token authenticated (payload may still be None if the
+                   call itself failed this cycle; the dir counts as live)
+      "expired"  — a 401: only Claude Code can re-seed that token
+      "notoken"  — nothing stored at all (logged out)
+
+    Callers need the expired/notoken split: an expired plan still has a label
+    and deserves a page saying so, a logged-out one has nothing to show.
+    """
+    results: dict[Path, dict] = {}
+    for d in read_config_dirs()[:MAX_PLANS]:
+        token = read_token_for(d)
+        if not token:
+            log(f"No token in {d}; skipping")
+            results[d] = {"state": "notoken", "payload": None}
+            continue
+        try:
+            payload = await poll_api(token)
+        except TokenExpired:
+            log(f"Token in {d} expired/invalid; skipping")
+            results[d] = {"state": "expired", "payload": None}
+            continue
+        results[d] = {"state": "ok", "payload": payload}
+    return results
+
+
 async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, bool]:
     """Poll every configured config dir; return ``(active_payload, all_dead)``.
 
@@ -553,32 +784,67 @@ async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, 
     Pure free-ride: a 401 (TokenExpired) means that dir's token has expired and
     only Claude Code (its owner) can re-seed it — we never refresh it ourselves.
     """
-    dirs = read_config_dirs()
-    payloads: dict[Path, dict] = {}
-    sessions: dict[Path, int] = {}
-    any_live = False
-    for d in dirs:
-        token = read_token_for(d)
-        if not token:
-            log(f"No token in {d}; skipping")
-            continue
-        try:
-            payload = await poll_api(token)
-        except TokenExpired:
-            log(f"Token in {d} expired/invalid; skipping")
-            continue
-        # Authenticated: a transient None here isn't an auth failure, so the
-        # dir counts as live and we stay silent rather than idling the device.
-        any_live = True
-        if payload is not None:
-            payloads[d] = payload
-            sessions[d] = int(payload.get("s", 0) or 0)
+    results = await poll_all()
+    payloads = {d: r["payload"] for d, r in results.items() if r["payload"] is not None}
+    any_live = any(r["state"] == "ok" for r in results.values())
     if not payloads:
         return None, not any_live
+    sessions = {d: int(p.get("s", 0) or 0) for d, p in payloads.items()}
     active = selector.choose(sessions)
-    if len(dirs) > 1:
+    if len(results) > 1:
         log(f"Active plan: {active} (s={sessions[active]})")
     return payloads[active], False
+
+
+# Keys that live once at the top level of a multi-plan payload, not per plan.
+_TOP_LEVEL_KEYS = ("ok", "c", "t", "tf")
+
+
+async def build_multi_payload(
+    selector: PlanSelector = _SELECTOR,
+) -> tuple[dict | None, bool]:
+    """The multi-plan payload the firmware renders as swipeable pages.
+
+    Shape: ``{"p": [{plan}, ...], "ap": <active index>, "ok": true}``. Each plan
+    carries a label ("n") plus either its numbers or ``"e": 1`` when its token
+    has expired — an expired plan keeps its page and says so, rather than
+    vanishing and renumbering the pages under your finger.
+
+    Returns the same ``(payload, all_dead)`` contract as :func:`poll_active`, so
+    a transient failure still yields ``(None, False)`` and the device holds its
+    last reading instead of flickering.
+    """
+    results = await poll_all()
+    if any(r["state"] == "ok" and r["payload"] is None for r in results.values()):
+        return None, False   # transient: keep what the device already shows
+
+    plans: list[dict] = []
+    active_dirs: dict[Path, int] = {}
+    sessions: dict[Path, int] = {}
+    for d, r in results.items():
+        if r["state"] == "notoken":
+            continue
+        entry: dict = {"n": read_plan_label(d)}
+        if r["payload"] is None:
+            entry["e"] = 1
+        else:
+            entry.update({k: v for k, v in r["payload"].items()
+                          if k not in _TOP_LEVEL_KEYS})
+            sessions[d] = int(r["payload"].get("s", 0) or 0)
+        active_dirs[d] = len(plans)
+        plans.append(entry)
+
+    if not plans:
+        return None, True
+    payload: dict = {"p": plans, "ok": True}
+    if sessions:
+        active = selector.choose(sessions)
+        payload["ap"] = active_dirs[active]
+        if len(plans) > 1:
+            log(f"Active plan: {active} (s={sessions[active]})")
+    add_chime_field(payload)
+    add_clock_fields(payload)
+    return payload, False
 
 
 async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None:
@@ -766,7 +1032,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                 # OAuth endpoint's rate limit (429). When no dir has a usable token
                 # we signal "No data" so the device idles instead of holding stale
                 # numbers until the CLI re-seeds it.
-                payload, dead = await poll_active()
+                payload, dead = await build_multi_payload()
                 if payload is not None:
                     if await session.write_payload(payload):
                         last_poll = time.time()

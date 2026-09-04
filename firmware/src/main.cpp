@@ -21,7 +21,7 @@
 #include "hal/imu_hal.h"
 #include "hal/sound_hal.h"
 
-static UsageData usage = {};
+static UsagePlans plans = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -97,8 +97,31 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
-// Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out) {
+// Fill one UsageData from a single plan object. Shared by both payload
+// shapes: a multi-plan "p" entry, and an older daemon's flat top-level object.
+static void parse_plan(JsonObjectConst o, UsageData* out) {
+    *out = UsageData{};
+    out->session_pct = o["s"] | 0.0f;
+    out->session_reset_mins = o["sr"] | -1;
+    out->weekly_pct = o["w"] | 0.0f;
+    out->weekly_reset_mins = o["wr"] | -1;
+    strlcpy(out->status, o["st"] | "unknown", sizeof(out->status));
+    const char* acct = o["acct"] | "pro";
+    out->enterprise = (strcmp(acct, "ent") == 0);
+    out->time_pct = o["tp"] | 0;
+    out->period_days = o["pd"] | 30;
+    strlcpy(out->reset_date, o["rd"] | "", sizeof(out->reset_date));
+    strlcpy(out->label, o["n"] | "", sizeof(out->label));
+    out->expired = (o["e"] | 0) != 0;   // daemon sends 1, not a JSON bool
+    out->scoped_pct = o["x"] | -1;
+    out->scoped_reset_mins = o["xr"] | -1;
+    strlcpy(out->scoped_name, o["xn"] | "", sizeof(out->scoped_name));
+}
+
+// Parse a JSON line into UsagePlans. Accepts the multi-plan payload
+// ({"p":[...],"ap":N}) and, for an older daemon, a flat single-plan object —
+// which also covers the {"ok":false} no-data beat.
+static bool parse_payload(const char* json, UsagePlans* out) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -106,20 +129,35 @@ static bool parse_json(const char* json, UsageData* out) {
         return false;
     }
 
-    out->session_pct = doc["s"] | 0.0f;
-    out->session_reset_mins = doc["sr"] | -1;
-    out->weekly_pct = doc["w"] | 0.0f;
-    out->weekly_reset_mins = doc["wr"] | -1;
-    strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
-    out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent
-    const char* acct = doc["acct"] | "pro";
-    out->enterprise = (strcmp(acct, "ent") == 0);
-    out->time_pct = doc["tp"] | 0;
-    out->period_days = doc["pd"] | 30;
-    strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
-    out->clock_epoch = doc["t"] | 0L;
-    out->clock_fmt = doc["tf"] | 24;
-    out->ok = doc["ok"] | false;
+    // ok / chime / clock are sent once for the whole payload, not per plan.
+    const bool ok = doc["ok"] | false;
+    const bool chime = doc["c"] | false;
+    const long clock_epoch = doc["t"] | 0L;
+    const int  clock_fmt = doc["tf"] | 24;
+
+    out->count = 0;
+    JsonArrayConst arr = doc["p"];
+    if (!arr.isNull()) {
+        for (JsonObjectConst o : arr) {
+            if (out->count >= MAX_PLANS) break;
+            parse_plan(o, &out->plan[out->count++]);
+        }
+    }
+    if (out->count == 0) {
+        parse_plan(doc.as<JsonObjectConst>(), &out->plan[0]);
+        out->count = 1;
+    }
+
+    int active = doc["ap"] | 0;
+    if (active < 0 || active >= out->count) active = 0;
+    out->active = active;
+    for (int i = 0; i < out->count; i++) {
+        out->plan[i].ok = ok;
+        out->plan[i].chime = chime;
+        out->plan[i].clock_epoch = clock_epoch;
+        out->plan[i].clock_fmt = clock_fmt;
+        out->plan[i].valid = true;
+    }
     out->valid = true;
     return true;
 }
@@ -372,23 +410,28 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            bool session_reset = usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            // 5-hour session limit refilled → chime so the user knows they can
-            // use Claude again (no-op on boards without a buzzer). Gated on the
-            // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
-            if (session_reset && usage.chime) {
-                Serial.println("session reset detected — chime");
-                sound_hal_play_reset();
+        if (parse_payload(ble_get_data(), &plans)) {
+            // Rate, chime and splash mood follow the plan actually being used —
+            // not whichever page happens to be on screen.
+            const UsageData& act = plans.plan[plans.active];
+            if (act.ok && !act.expired) {
+                int g_before = usage_rate_group();
+                bool session_reset = usage_rate_sample(act.session_pct);
+                int g_after = usage_rate_group();
+                // 5-hour session limit refilled → chime so the user knows they can
+                // use Claude again (no-op on boards without a buzzer). Gated on the
+                // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
+                if (session_reset && act.chime) {
+                    Serial.println("session reset detected — chime");
+                    sound_hal_play_reset();
+                }
+                if (g_after != g_before) {
+                    Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+                        g_before, g_after, act.session_pct);
+                    if (splash_is_active()) splash_pick_for_current_rate();
+                }
             }
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
-            }
-            ui_update(&usage);
+            ui_update_plans(&plans);
             ble_send_ack();
         } else {
             ble_send_nack();
